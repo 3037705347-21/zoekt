@@ -154,22 +154,20 @@ func runSync(name string, args []string, out, errOut io.Writer) error {
 			return err
 		}
 		defer lock.Close() // best-effort unlock on process exit
+
+		// Finish or undo any replacement interrupted by a killed or failed
+		// sync before touching the live cache.
+		if err := recoverTransactions(indexDir, out); err != nil {
+			return err
+		}
 	}
 
 	repositories, err := discoverRepositories(flags.Args())
 	if err != nil {
 		return err
 	}
-	shards, err := readInventory(indexDir)
-	if err != nil {
-		return err
-	}
-	actions := planPrune(repositories, shards)
-	if err := applyRemovals(actions, !config.force, out); err != nil {
-		return err
-	}
 
-	if err := indexRepositories(repositories, gitindex.Options{
+	if err := synchronizeRepositories(indexDir, repositories, gitindex.Options{
 		BuildOptions:       config.buildOptions,
 		Branches:           splitBranches(config.branches),
 		BranchPrefix:       config.branchPrefix,
@@ -177,7 +175,7 @@ func runSync(name string, args []string, out, errOut io.Writer) error {
 		Submodules:         config.submodules,
 		Incremental:        true,
 		DryRun:             !config.force,
-	}, out); err != nil {
+	}, !config.force, out); err != nil {
 		return err
 	}
 	if !config.force {
@@ -233,6 +231,10 @@ func runRemove(args []string, out, errOut io.Writer) error {
 			return err
 		}
 		defer lock.Close() // best-effort unlock on process exit
+
+		if err := recoverTransactions(dir, out); err != nil {
+			return err
+		}
 	}
 	if err := removeRepositories(dir, flags.Args(), !*force, out); err != nil {
 		return err

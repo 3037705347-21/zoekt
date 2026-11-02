@@ -54,6 +54,16 @@ type pruneAction struct {
 	Reason string
 }
 
+// shardGroup is the set of live shard files carrying one (repository name,
+// source) identity. A moved repository leaves one group behind and requires
+// another to be published.
+type shardGroup struct {
+	Name   string
+	Source string
+	ID     uint32
+	Shards []shardInfo
+}
+
 func readInventory(indexDir string) ([]shardInfo, error) {
 	entries, err := os.ReadDir(indexDir)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -96,34 +106,130 @@ func normalizeSource(source string) string {
 	return source
 }
 
-func planPrune(desired []repositorySpec, shards []shardInfo) []pruneAction {
-	desiredBySource := make(map[string]repositorySpec, len(desired))
+func groupShards(shards []shardInfo) []shardGroup {
+	type groupKey struct {
+		name   string
+		source string
+	}
+	byKey := map[groupKey]*shardGroup{}
+	for _, shard := range shards {
+		key := groupKey{
+			name:   shard.Repository.Name,
+			source: normalizeSource(shard.Repository.Source),
+		}
+		group := byKey[key]
+		if group == nil {
+			group = &shardGroup{
+				Name:   key.name,
+				Source: key.source,
+				ID:     shard.Repository.ID,
+			}
+			byKey[key] = group
+		}
+		group.Shards = append(group.Shards, shard)
+	}
+
+	groups := make([]shardGroup, 0, len(byKey))
+	for _, group := range byKey {
+		sort.Slice(group.Shards, func(i, j int) bool { return group.Shards[i].Path < group.Shards[j].Path })
+		groups = append(groups, *group)
+	}
+	sort.Slice(groups, func(i, j int) bool {
+		if groups[i].Name != groups[j].Name {
+			return groups[i].Name < groups[j].Name
+		}
+		return groups[i].Source < groups[j].Source
+	})
+	return groups
+}
+
+type repoAction int
+
+const (
+	// actionProbe needs an incremental check against the live same-source
+	// shards before deciding whether the cache is reused.
+	actionProbe repoAction = iota
+	// actionIndex builds the first cache for a repository.
+	actionIndex
+	// actionReplace stages a new generation and retires every live group
+	// carrying the repository name.
+	actionReplace
+)
+
+type repoTask struct {
+	spec     repositorySpec
+	action   repoAction
+	matching *shardGroup
+	others   []shardGroup
+}
+
+// planSync decides what to do with every desired repository and every live
+// shard group. Groups whose repository name is no longer desired are pruned;
+// a moved repository (same name, new source) is never pruned ahead of the
+// rebuild, but scheduled for an atomic replacement.
+func planSync(desired []repositorySpec, groups []shardGroup) ([]pruneAction, []repoTask) {
+	desiredByName := map[string]repositorySpec{}
+	desiredBySource := map[string]repositorySpec{}
 	for _, repo := range desired {
+		desiredByName[repo.Name] = repo
 		desiredBySource[normalizeSource(repo.Source)] = repo
 	}
 
-	var actions []pruneAction
-	for _, shard := range shards {
-		repo := shard.Repository
-		desiredRepo, exists := desiredBySource[normalizeSource(repo.Source)]
-		if exists && desiredRepo.Name == repo.Name {
-			continue
-		}
-
-		reason := "repository is no longer selected"
-		if exists {
-			reason = fmt.Sprintf("repository is now named %q", desiredRepo.Name)
-		}
-		actions = append(actions, pruneAction{
-			Shard:  shard.Path,
-			Name:   repo.Name,
-			Source: normalizeSource(repo.Source),
-			Reason: reason,
-		})
+	groupsByName := map[string][]shardGroup{}
+	for _, group := range groups {
+		groupsByName[group.Name] = append(groupsByName[group.Name], group)
 	}
 
-	sort.Slice(actions, func(i, j int) bool { return actions[i].Shard < actions[j].Shard })
-	return actions
+	var removals []pruneAction
+	for _, group := range groups {
+		if _, ok := desiredByName[group.Name]; ok {
+			continue
+		}
+		reason := "repository is no longer selected"
+		if renamed, ok := desiredBySource[group.Source]; ok {
+			reason = fmt.Sprintf("repository is now named %q", renamed.Name)
+		}
+		for _, shard := range group.Shards {
+			removals = append(removals, pruneAction{
+				Shard:  shard.Path,
+				Name:   group.Name,
+				Source: group.Source,
+				Reason: reason,
+			})
+		}
+	}
+	sort.Slice(removals, func(i, j int) bool { return removals[i].Shard < removals[j].Shard })
+
+	tasks := make([]repoTask, 0, len(desired))
+	for _, repo := range desired {
+		live := groupsByName[repo.Name]
+		declaredSource := normalizeSource(repo.Source)
+
+		var matching *shardGroup
+		var others []shardGroup
+		for i := range live {
+			if live[i].Source == declaredSource {
+				group := live[i]
+				matching = &group
+			} else {
+				others = append(others, live[i])
+			}
+		}
+
+		action := actionReplace
+		if matching == nil && len(live) == 0 {
+			action = actionIndex
+		} else if matching != nil {
+			action = actionProbe
+		}
+		tasks = append(tasks, repoTask{
+			spec:     repo,
+			action:   action,
+			matching: matching,
+			others:   others,
+		})
+	}
+	return removals, tasks
 }
 
 func removeShard(path string) error {
@@ -158,26 +264,267 @@ func applyRemovals(actions []pruneAction, dryRun bool, out io.Writer) error {
 	return errors.Join(errs...)
 }
 
-func indexRepositories(repositories []repositorySpec, opts gitindex.Options, out io.Writer) error {
+// probeRepository reports whether the live same-source cache for spec is
+// stale. It never writes to the index.
+func probeRepository(spec repositorySpec, opts gitindex.Options, indexDir string) (bool, error) {
+	probeOpts := opts
+	probeOpts.RepoDir = spec.Source
+	probeOpts.DryRun = true
+	probeOpts.Incremental = true
+	probeOpts.BuildOptions = opts.BuildOptions
+	probeOpts.BuildOptions.IndexDir = indexDir
+	probeOpts.BuildOptions.RepositoryDescription = zoekt.Repository{Name: spec.Name}
+	return gitindex.IndexGitRepo(probeOpts)
+}
+
+// parseShardNumber extracts the format version and shard number from a shard
+// basename.
+func parseShardNumber(basename string) (version, number int, ok bool) {
+	match := shardNumberRegexp.FindStringSubmatch(basename)
+	if match == nil {
+		return 0, 0, false
+	}
+	fmt.Sscanf(match[1], "%d", &version)
+	fmt.Sscanf(match[2], "%d", &number)
+	return version, number, true
+}
+
+// canConsolidate reports whether the matching same-source group is a complete
+// shard set by itself, so the other-source groups can be retired without a
+// rebuild. The matching shards must be one format version numbered
+// contiguously from zero; stale extras may only carry higher numbers.
+func canConsolidate(matching shardGroup, others []shardGroup) bool {
+	if len(matching.Shards) == 0 {
+		return false
+	}
+	version := -1
+	var numbers []int
+	for _, shard := range matching.Shards {
+		v, n, ok := parseShardNumber(filepath.Base(shard.Path))
+		if !ok {
+			return false
+		}
+		if version == -1 {
+			version = v
+		} else if version != v {
+			return false
+		}
+		numbers = append(numbers, n)
+	}
+	sort.Ints(numbers)
+	for i, n := range numbers {
+		if n != i {
+			return false
+		}
+	}
+	for _, group := range others {
+		for _, shard := range group.Shards {
+			_, n, ok := parseShardNumber(filepath.Base(shard.Path))
+			if !ok || n < len(numbers) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func groupArtifacts(groups []shardGroup) (files, sources []string, ids map[uint32]struct{}, err error) {
+	fileSet := map[string]struct{}{}
+	sourceSet := map[string]struct{}{}
+	ids = map[uint32]struct{}{}
+	for _, group := range groups {
+		sourceSet[group.Source] = struct{}{}
+		if group.ID != 0 {
+			ids[group.ID] = struct{}{}
+		}
+		for _, shard := range group.Shards {
+			paths, err := index.IndexFilePaths(shard.Path)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("resolve artifacts of %s: %w", shard.Path, err)
+			}
+			for _, path := range paths {
+				fileSet[filepath.Base(path)] = struct{}{}
+			}
+		}
+	}
+	for file := range fileSet {
+		files = append(files, file)
+	}
+	for source := range sourceSet {
+		sources = append(sources, source)
+	}
+	sort.Strings(files)
+	sort.Strings(sources)
+	return files, sources, ids, nil
+}
+
+func formatSources(sources []string) string {
+	return strings.Join(sources, ", ")
+}
+
+// executeReplacement builds the new generation in a private staging
+// directory and only switches after it has been verified. The previous
+// generation remains searchable until the switch and is restored if anything
+// goes wrong.
+func executeReplacement(indexDir string, task repoTask, oldGroups []shardGroup, opts gitindex.Options, out io.Writer) error {
+	r, err := newReplacement(indexDir)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = r.discard()
+		}
+	}()
+
+	oldFiles, oldSources, oldIDs, err := groupArtifacts(oldGroups)
+	if err != nil {
+		return err
+	}
+	r.journal.OldFiles = oldFiles
+	r.journal.OldSources = oldSources
+
+	fmt.Fprintf(out, "Indexing %q from %s\n", task.spec.Name, task.spec.Source)
+	if err := r.build(task.spec, opts); err != nil {
+		return err
+	}
+	if r.journal.ID != 0 {
+		for oldID := range oldIDs {
+			if oldID != r.journal.ID {
+				return fmt.Errorf("conflict: repository %q changed ID from %d to %d; keeping the previous searchable cache", task.spec.Name, oldID, r.journal.ID)
+			}
+		}
+	}
+	if err := r.commit(out); err != nil {
+		return err
+	}
+	committed = true
+	fmt.Fprintf(out, "Indexed %q from %s\n", task.spec.Name, task.spec.Source)
+	return nil
+}
+
+// executeConsolidation retires stale other-source groups while adopting the
+// complete same-source group already live.
+func executeConsolidation(indexDir string, task repoTask, opts gitindex.Options, out io.Writer) error {
+	r, err := newReplacement(indexDir)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = r.discard()
+		}
+	}()
+
+	keepFiles, _, keepIDs, err := groupArtifacts([]shardGroup{*task.matching})
+	if err != nil {
+		return err
+	}
+	oldFiles, oldSources, _, err := groupArtifacts(task.others)
+	if err != nil {
+		return err
+	}
+	r.journal.Name = task.spec.Name
+	r.journal.ID = task.matching.ID
+	r.journal.NewSource = normalizeSource(task.spec.Source)
+	r.journal.KeepFiles = keepFiles
+	r.journal.OldFiles = oldFiles
+	r.journal.OldSources = oldSources
+	for id := range keepIDs {
+		r.journal.ID = id
+	}
+	if err := r.commit(out); err != nil {
+		return err
+	}
+	committed = true
+	fmt.Fprintf(out, "Consolidated %q onto %s; retired stale cache from %s\n", task.spec.Name, r.journal.NewSource, formatSources(oldSources))
+	return nil
+}
+
+func synchronizeOne(indexDir string, task repoTask, opts gitindex.Options, dryRun bool, out io.Writer) error {
+	declared := task.spec
+	declaredSource := normalizeSource(declared.Source)
+	liveGroups := task.others
+	if task.matching != nil {
+		liveGroups = append(liveGroups, *task.matching)
+	}
+
+	switch task.action {
+	case actionIndex:
+		if dryRun {
+			fmt.Fprintf(out, "Would index %q from %s\n", declared.Name, declared.Source)
+			return nil
+		}
+		return executeReplacement(indexDir, task, nil, opts, out)
+
+	case actionReplace:
+		oldSources := sourcesOf(liveGroups)
+		if dryRun {
+			fmt.Fprintf(out, "Would replace cached source %s for %q with %s\n", formatSources(oldSources), declared.Name, declaredSource)
+			fmt.Fprintf(out, "Would index %q from %s\n", declared.Name, declared.Source)
+			return nil
+		}
+		return executeReplacement(indexDir, task, liveGroups, opts, out)
+	}
+
+	// actionProbe: a same-source group is live. Check whether it is current.
+	updated, err := probeRepository(declared, opts, indexDir)
+	if err != nil {
+		return fmt.Errorf("check %q from %s: %w", declared.Name, declared.Source, err)
+	}
+	if !updated {
+		if len(task.others) == 0 {
+			fmt.Fprintf(out, "Up to date %q from %s\n", declared.Name, declared.Source)
+			return nil
+		}
+		if canConsolidate(*task.matching, task.others) {
+			oldSources := sourcesOf(task.others)
+			if dryRun {
+				fmt.Fprintf(out, "Would remove stale cache for %q from %s\n", declared.Name, formatSources(oldSources))
+				return nil
+			}
+			return executeConsolidation(indexDir, task, opts, out)
+		}
+	}
+
+	if dryRun {
+		fmt.Fprintf(out, "Would index %q from %s\n", declared.Name, declared.Source)
+		return nil
+	}
+	return executeReplacement(indexDir, task, liveGroups, opts, out)
+}
+
+func sourcesOf(groups []shardGroup) []string {
+	seen := map[string]struct{}{}
+	var sources []string
+	for _, group := range groups {
+		if _, ok := seen[group.Source]; !ok {
+			seen[group.Source] = struct{}{}
+			sources = append(sources, group.Source)
+		}
+	}
+	sort.Strings(sources)
+	return sources
+}
+
+// synchronizeRepositories prunes repositories no longer selected and brings
+// every desired repository's cache through a recoverable replacement.
+func synchronizeRepositories(indexDir string, repositories []repositorySpec, opts gitindex.Options, dryRun bool, out io.Writer) error {
+	shards, err := readInventory(indexDir)
+	if err != nil {
+		return err
+	}
+	removals, tasks := planSync(repositories, groupShards(shards))
+	if err := applyRemovals(removals, dryRun, out); err != nil {
+		return err
+	}
+
 	var errs []error
-	for _, repo := range repositories {
-		repoOpts := opts
-		repoOpts.RepoDir = repo.Source
-		repoOpts.BuildOptions.RepositoryDescription = zoekt.Repository{Name: repo.Name}
-		if !repoOpts.DryRun {
-			fmt.Fprintf(out, "Indexing %q from %s\n", repo.Name, repo.Source)
-		}
-		updated, err := gitindex.IndexGitRepo(repoOpts)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("index %q from %s: %w", repo.Name, repo.Source, err))
-			continue
-		}
-		if repoOpts.DryRun && updated {
-			fmt.Fprintf(out, "Would index %q from %s\n", repo.Name, repo.Source)
-		} else if updated {
-			fmt.Fprintf(out, "Indexed %q from %s\n", repo.Name, repo.Source)
-		} else {
-			fmt.Fprintf(out, "Up to date %q from %s\n", repo.Name, repo.Source)
+	for _, task := range tasks {
+		if err := synchronizeOne(indexDir, task, opts, dryRun, out); err != nil {
+			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
