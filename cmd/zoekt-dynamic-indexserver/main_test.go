@@ -67,7 +67,7 @@ func TestInitMetrics(t *testing.T) {
 	}
 }
 
-func TestIndexRepository(t *testing.T) {
+func TestBuildIndex(t *testing.T) {
 	var cmdHistory [][]string
 
 	executeCmd = func(ctx context.Context, name string, arg ...string) (err error) {
@@ -88,15 +88,17 @@ func TestIndexRepository(t *testing.T) {
 		RepoID:   100,
 	}
 
-	_, err := indexRepository(opts, req)
-	if err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
+	defer cancel()
+
+	if err := buildIndex(ctx, opts, req, "/staging_dir"); err != nil {
 		t.Fatal(err)
 	}
 
 	expectedHistory := [][]string{
 		{"zoekt-git-clone", "-dest", "/repo_dir", "-name", "100", "-repoid", "100", "https://example.com/repository.git"},
 		{"git", "-C", "/repo_dir/100.git", "fetch"},
-		{"zoekt-git-index", "-index", "/index_dir", "/repo_dir/100.git"},
+		{"zoekt-git-index", "-index", "/staging_dir", "/repo_dir/100.git"},
 	}
 
 	if !reflect.DeepEqual(cmdHistory, expectedHistory) {
@@ -104,7 +106,7 @@ func TestIndexRepository(t *testing.T) {
 	}
 }
 
-func TestIndexRepositoryWhenErr(t *testing.T) {
+func TestBuildIndexWhenErr(t *testing.T) {
 	var cmdHistory [][]string
 
 	executeCmd = func(ctx context.Context, name string, arg ...string) (err error) {
@@ -129,9 +131,10 @@ func TestIndexRepositoryWhenErr(t *testing.T) {
 		RepoID:   100,
 	}
 
-	_, err := indexRepository(opts, req)
+	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
+	defer cancel()
 
-	if err == nil {
+	if err := buildIndex(ctx, opts, req, "/staging_dir"); err == nil {
 		t.Errorf("Error is empty, when it should be present")
 	}
 
