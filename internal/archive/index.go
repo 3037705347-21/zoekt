@@ -2,10 +2,13 @@
 package archive
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -23,6 +26,13 @@ type Options struct {
 	Branch  string
 	Commit  string
 	Strip   int
+
+	// DownloadDir caches partially downloaded remote archives so an
+	// interrupted run resumes from the last verified byte instead of
+	// restarting. It defaults to a ".archive" subdirectory of the index
+	// directory. Files in it never have a ".zoekt" name and are never
+	// loaded as search indices.
+	DownloadDir string
 }
 
 func (o *Options) SetDefaults() {
@@ -107,11 +117,28 @@ func Index(opts Options, bopts index.Options) error {
 		return nil
 	}
 
-	a, err := openArchive(opts.Archive)
+	// Remote archives are fully downloaded into a private, identity-checked
+	// cache before anything is indexed: interrupted runs resume from the
+	// last verified offset, and replaced or inconsistent source content
+	// forces a complete re-download. Local archives are opened directly.
+	var download *archiveDownload
+	archivePath := opts.Archive
+	if isHTTPURL(opts.Archive) {
+		d, err := downloadArchive(context.Background(), opts.Archive, opts.Commit, opts.downloadDir(bopts))
+		if err != nil {
+			return err
+		}
+		download = d
+		archivePath = d.partPath
+	}
+
+	a, err := openArchiveSource(archivePath, download != nil)
 	if err != nil {
+		if download != nil {
+			download.release(false)
+		}
 		return err
 	}
-	defer a.Close()
 
 	bopts.RepositoryDescription.Source = opts.Archive
 	var builder *index.Builder
@@ -147,21 +174,69 @@ func Index(opts Options, bopts index.Options) error {
 		})
 	}
 
+	var loopErr error
+loop:
 	for {
 		f, err := a.Next()
 		if err == io.EOF {
-			break
+			break loop
 		}
 		if err != nil {
-			return err
+			loopErr = err
+			break loop
 		}
 
 		if err := add(f); err != nil {
-			return err
+			loopErr = err
+			break loop
 		}
 	}
 
-	return builder.Finish()
+	if builder != nil {
+		if loopErr != nil {
+			// Source read failed (network residue, checksum mismatch,
+			// truncated archive): drop every temporary shard so an
+			// interrupted build cannot replace the existing index.
+			_ = builder.Abort()
+		} else if err := builder.Finish(); err != nil {
+			loopErr = err
+		}
+	}
+	if err := a.Close(); loopErr == nil {
+		loopErr = err
+	}
+
+	// The download cache is only removed after the complete archive has
+	// been read, verified and produced the replacement index. Keep it on
+	// failure so the next run can resume.
+	if download != nil {
+		download.release(loopErr == nil)
+	}
+	return loopErr
+}
+
+// openArchiveSource opens either a fully downloaded local file or the
+// original local/stdin source.
+func openArchiveSource(path string, downloaded bool) (Archive, error) {
+	if downloaded {
+		return openArchiveFile(path)
+	}
+	return openArchive(path)
+}
+
+func isHTTPURL(u string) bool {
+	return strings.HasPrefix(u, "https://") || strings.HasPrefix(u, "http://")
+}
+
+// downloadDir resolves where partial downloads are stored.
+func (o Options) downloadDir(bopts index.Options) string {
+	if o.DownloadDir != "" {
+		return o.DownloadDir
+	}
+	if bopts.IndexDir != "" {
+		return filepath.Join(bopts.IndexDir, ".archive")
+	}
+	return filepath.Join(os.TempDir(), "zoekt-archive")
 }
 
 // stripComponents removes the specified number of leading path

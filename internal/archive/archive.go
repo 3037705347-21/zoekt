@@ -30,11 +30,24 @@ type File struct {
 type tarArchive struct {
 	io.Closer
 	tr *tar.Reader
+	// gz is set for gzip-compressed tar archives so its checksum trailer
+	// can be verified once the whole archive has been read.
+	gz       *gzip.Reader
+	verified bool
 }
 
 func (a *tarArchive) Next() (*File, error) {
 	for {
 		hdr, err := a.tr.Next()
+		if err == io.EOF && a.gz != nil && !a.verified {
+			// Read the gzip stream to its end so its CRC32 and size trailer
+			// are validated. A truncated download fails here instead of
+			// silently producing a partial index.
+			if _, verr := io.Copy(io.Discard, a.gz); verr != nil {
+				return nil, fmt.Errorf("verifying compressed archive: %w", verr)
+			}
+			a.verified = true
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -166,29 +179,50 @@ func openArchive(u string) (ar Archive, err error) {
 	if err != nil {
 		return nil, err
 	}
+	return archiveFromReader(readCloser, readCloser)
+}
+
+// openArchiveFile opens the tar, tgz or zip archive stored at the local path.
+func openArchiveFile(path string) (Archive, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	return archiveFromReader(f, f)
+}
+
+// archiveFromReader detects the archive format on r and returns an Archive.
+// closer is closed when the returned Archive is closed.
+func archiveFromReader(r io.Reader, closer io.Closer) (ar Archive, err error) {
 	defer func() {
 		if err != nil {
-			_ = readCloser.Close()
+			_ = closer.Close()
 		}
 	}()
 
-	ct, r, err := detectContentType(readCloser)
+	ct, r, err := detectContentType(r)
 	if err != nil {
 		return nil, err
 	}
 	switch ct {
 	case "application/x-gzip":
-		r, err = gzip.NewReader(r)
+		gz, err := gzip.NewReader(r)
 		if err != nil {
 			return nil, err
 		}
 
+		return &tarArchive{
+			Closer: closer,
+			tr:     tar.NewReader(gz),
+			gz:     gz,
+		}, nil
+
 	case "application/zip":
-		return newZipArchive(r, readCloser)
+		return newZipArchive(r, closer)
 	}
 
 	return &tarArchive{
-		Closer: readCloser,
+		Closer: closer,
 		tr:     tar.NewReader(r),
 	}, nil
 }

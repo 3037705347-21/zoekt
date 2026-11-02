@@ -657,6 +657,31 @@ func (b *Builder) MarkFileAsChangedOrRemoved(path string) {
 	b.opts.changedOrRemovedFiles = append(b.opts.changedOrRemovedFiles, path)
 }
 
+// Abort discards all temporary shard files produced by this builder without
+// publishing a new index. It is used when reading the source failed before the
+// full corpus was consumed: callers must not Finish a partial build, as that
+// could replace a good index with one missing documents.
+//
+// It is safe to call Abort together with (or instead of) Finish.
+func (b *Builder) Abort() error {
+	if b.finishCalled {
+		return nil
+	}
+	b.finishCalled = true
+
+	// Wait for shards already being written, then remove every temporary
+	// shard. Documents still buffered in memory are simply dropped.
+	b.building.Wait()
+
+	for tmp := range b.finishedShards {
+		if err := os.Remove(tmp); err != nil && !os.IsNotExist(err) {
+			log.Printf("Builder.Abort failed to remove %s: %v", tmp, err)
+		}
+	}
+	b.finishedShards = map[string]string{}
+	return nil
+}
+
 // Finish creates a last shard from the buffered documents, and clears
 // stale shards from previous runs. This should always be called, also
 // in failure cases, to ensure cleanup.

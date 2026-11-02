@@ -27,6 +27,8 @@ func main() {
 		commit = flag.String("commit", "", "The commit sha for the archive. If incremental this will avoid updating shards already at commit")
 		strip  = flag.Int("strip_components", 0, "Remove the specified number of leading path elements. Pathnames with fewer elements will be silently skipped.")
 
+		downloadDir = flag.String("download_dir", "", "Directory used to cache partially downloaded archives so interrupted runs resume from the last verified byte (defaults to <index dir>/.archive)")
+
 		downloadLimitMbps = flag.Int64("download-limit-mbps", 0, "If non-zero, limit archive downloads to specified amount in megabits per second")
 	)
 	flag.Parse()
@@ -44,12 +46,13 @@ func main() {
 	opts := archive.Options{
 		Incremental: *incremental,
 
-		Archive: archiveURL,
-		Name:    *name,
-		RepoURL: *urlRaw,
-		Branch:  *branch,
-		Commit:  *commit,
-		Strip:   *strip,
+		Archive:     archiveURL,
+		Name:        *name,
+		RepoURL:     *urlRaw,
+		Branch:      *branch,
+		Commit:      *commit,
+		Strip:       *strip,
+		DownloadDir: *downloadDir,
 	}
 
 	// Sourcegraph specific: Limit HTTP traffic
