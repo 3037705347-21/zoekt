@@ -68,6 +68,21 @@ Removal, like synchronization, previews by default and requires `-f` to apply:
     zoekt-local-sync remove -index ~/.zoekt path/to/repo
     zoekt-local-sync remove -index ~/.zoekt -f path/to/repo
 
+For checkouts managed by the Android `repo` tool, pass the release manifest
+with `-manifest` (an XML file, a directory containing `manifest.xml`, or a
+client root containing `.repo/manifest.xml`). Repositories are then identified
+by the stable manifest project `name` rather than their current checkout path,
+and only manifest projects beneath the roots are indexed, so stale directories
+left by older release branches are ignored. When a project moves to another
+path in a new manifest branch, its index follows it and stays searchable under
+the same name; shards are removed only when the project disappears from the
+manifest. Removals run after indexing and a manifest parse or indexing failure
+leaves the previous index in place, so interrupted or failed syncs converge on
+retry:
+
+    zoekt-local-sync -index ~/.zoekt -manifest ~/android/.repo/manifest.xml ~/android
+    zoekt-local-sync -index ~/.zoekt -f -manifest ~/android/.repo/manifest.xml ~/android
+
 #### Indexing a local directory (not git-specific)
 
     go install github.com/sourcegraph/zoekt/cmd/zoekt-index@latest

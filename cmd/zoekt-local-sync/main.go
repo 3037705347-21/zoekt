@@ -41,6 +41,7 @@ type stringSliceFlag []string
 
 type syncConfig struct {
 	force        bool
+	manifest     string
 	branches     string
 	branchPrefix string
 	allowMissing bool
@@ -111,6 +112,7 @@ func newSyncFlagSet(name string, output io.Writer) (*flag.FlagSet, *syncConfig) 
 	flags.SetOutput(output)
 	config := &syncConfig{}
 	flags.BoolVar(&config.force, "f", false, "synchronize the index")
+	flags.StringVar(&config.manifest, "manifest", "", "Android repo manifest XML file (or a directory containing manifest.xml) naming the projects to index")
 	flags.StringVar(&config.branches, "branches", "HEAD", "git branches to index")
 	flags.StringVar(&config.branchPrefix, "prefix", "refs/heads/", "prefix for branch names")
 	flags.BoolVar(&config.allowMissing, "allow_missing_branches", false, "allow missing branches")
@@ -156,7 +158,15 @@ func runSync(name string, args []string, out, errOut io.Writer) error {
 		defer lock.Close() // best-effort unlock on process exit
 	}
 
-	repositories, err := discoverRepositories(flags.Args())
+	// Resolve the complete desired repository set before touching the index,
+	// so that manifest parsing or checkout discovery failures leave the
+	// previous index in place.
+	var repositories []repositorySpec
+	if config.manifest != "" {
+		repositories, err = discoverManifestRepositories(config.manifest, flags.Args())
+	} else {
+		repositories, err = discoverRepositories(flags.Args())
+	}
 	if err != nil {
 		return err
 	}
@@ -164,12 +174,26 @@ func runSync(name string, args []string, out, errOut io.Writer) error {
 	if err != nil {
 		return err
 	}
-	actions := planPrune(repositories, shards)
-	if err := applyRemovals(actions, !config.force, out); err != nil {
-		return err
+
+	// In manifest mode projects keep their identity across path moves: only
+	// projects that disappeared from the manifest are pruned.
+	var actions []pruneAction
+	if config.manifest != "" {
+		actions = planManifestPrune(repositories, shards)
+	} else {
+		actions = planPrune(repositories, shards)
 	}
 
-	if err := indexRepositories(repositories, gitindex.Options{
+	// In preview mode removals are only reported. When applying changes the
+	// removals are deferred until indexing succeeds, so a failed sync keeps
+	// serving the previous index.
+	if !config.force {
+		if err := applyRemovals(actions, true, out); err != nil {
+			return err
+		}
+	}
+
+	results, err := indexRepositories(repositories, gitindex.Options{
 		BuildOptions:       config.buildOptions,
 		Branches:           splitBranches(config.branches),
 		BranchPrefix:       config.branchPrefix,
@@ -177,10 +201,22 @@ func runSync(name string, args []string, out, errOut io.Writer) error {
 		Submodules:         config.submodules,
 		Incremental:        true,
 		DryRun:             !config.force,
-	}, out); err != nil {
+	}, out)
+	if err != nil {
 		return err
 	}
-	if !config.force {
+
+	if config.manifest != "" {
+		if err := reconcileManifestMoves(indexDir, repositories, shards, results, !config.force, out); err != nil {
+			return err
+		}
+	}
+
+	if config.force {
+		if err := applyRemovals(actions, false, out); err != nil {
+			return err
+		}
+	} else {
 		fmt.Fprintln(out, "Pass -f to apply these changes.")
 	}
 	return nil
