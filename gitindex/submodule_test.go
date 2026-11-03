@@ -33,6 +33,7 @@ func TestParseGitModules(t *testing.T) {
 		branch = .`,
 			map[string]*SubmoduleEntry{
 				"plugins/abc": {
+					Name:   "plugins/abc",
 					Path:   "plugins/abc",
 					URL:    "../plugins/abc",
 					Branch: ".",
@@ -46,6 +47,7 @@ func TestParseGitModules(t *testing.T) {
 			branch = .`,
 			map[string]*SubmoduleEntry{
 				"plugins/abc": {
+					Name:   "plugins/abc",
 					Path:   "plugins/abc",
 					URL:    "../plugins/abc",
 					Branch: ".",

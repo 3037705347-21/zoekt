@@ -429,6 +429,22 @@ type Options struct {
 	// Specifies the root of a Repository cache. Needed for submodule indexing.
 	RepoCacheDir string
 
+	// SubmoduleRosterDir, when set together with Submodules, enables the
+	// submodule roster: each submodule's last-known-good contents and its
+	// attribution (identity, URL, path in this repository and gitlink
+	// commit) are persisted there. A submodule that temporarily cannot be
+	// read is served from its saved content; its content is only retired
+	// after a complete successful build confirms the submodule was removed.
+	// If no trusted content or attribution is available for a currently
+	// referenced submodule, the whole indexing run fails without replacing
+	// the existing shard.
+	SubmoduleRosterDir string
+
+	// submoduleRoster is the active roster handle for this run. It is
+	// unexported because it is created from SubmoduleRosterDir and carried
+	// through the recursive build preparation.
+	submoduleRoster *submoduleRoster
+
 	// Indexing options.
 	BuildOptions index.Options
 
@@ -578,6 +594,18 @@ func indexGitRepo(opts Options, config gitIndexConfig) (bool, error) {
 		return true, nil
 	}
 
+	if opts.Submodules && opts.SubmoduleRosterDir != "" && opts.submoduleRoster == nil {
+		roster, err := openSubmoduleRoster(
+			opts.SubmoduleRosterDir,
+			opts.RepoDir,
+			opts.BuildOptions.RepositoryDescription.Name,
+		)
+		if err != nil {
+			return false, fmt.Errorf("open submodule roster: %w", err)
+		}
+		opts.submoduleRoster = roster
+	}
+
 	// branch => (path, sha1) => repo.
 	var repos map[fileKey]BlobLocation
 
@@ -614,8 +642,12 @@ func indexGitRepo(opts Options, config gitIndexConfig) (bool, error) {
 	for path, info := range reposByPath {
 		tpl := opts.BuildOptions.RepositoryDescription
 		if path != "" {
-			tpl = zoekt.Repository{URL: info.URL.String()}
-			if info.URL.String() != "" {
+			urlString := ""
+			if info.URL != nil {
+				urlString = info.URL.String()
+			}
+			tpl = zoekt.Repository{URL: urlString}
+			if urlString != "" {
 				if err := SetTemplatesFromOrigin(&tpl, info.URL); err != nil {
 					log.Printf("setTemplatesFromOrigin(%s, %s): %s", path, info.URL, err)
 				}
@@ -739,7 +771,18 @@ func indexGitRepo(opts Options, config gitIndexConfig) (bool, error) {
 		}
 	}
 
-	return true, builder.Finish()
+	// The shard is the main artifact: only publish the roster once the
+	// complete build (parent repository plus every current submodule) has
+	// been written successfully.
+	if err := builder.Finish(); err != nil {
+		return true, err
+	}
+	if opts.submoduleRoster != nil {
+		if err := opts.submoduleRoster.commit(); err != nil {
+			return true, fmt.Errorf("commit submodule roster: %w", err)
+		}
+	}
+	return true, nil
 }
 
 // indexCatfileBlobs streams main-repo blobs from the catfileReader into the
@@ -1145,6 +1188,11 @@ func prepareNormalBuildRecurse(options Options, repository *git.Repository, repo
 	}
 
 	rw := NewRepoWalker(repository, repoURL, repoCache)
+	// The roster guards direct submodules of the repository being indexed
+	// only. Walkers recursing into a submodule must not start a new roster.
+	if !isSubrepo && options.submoduleRoster != nil {
+		rw.roster = options.submoduleRoster
+	}
 	for _, b := range branches {
 		commit, err := getCommit(repository, options.BranchPrefix, b)
 		if err != nil {
@@ -1180,31 +1228,85 @@ func prepareNormalBuildRecurse(options Options, repository *git.Repository, repo
 			return nil, nil, fmt.Errorf("failed to get submodules: %w", err)
 		}
 
+		// Roster protection applies to the direct submodules of the
+		// repository being indexed; nested submodules keep their historical
+		// best-effort behavior.
+		rosterActive := options.submoduleRoster != nil && !isSubrepo
+		configuredPaths := make(map[string]struct{}, len(submodules))
 		for _, submodule := range submodules {
+			configuredPaths[submodule.Config().Path] = struct{}{}
+		}
+
+		for _, submodule := range submodules {
+			submoduleConfig := submodule.Config()
 			subRepository, err := submodule.Repository()
 			if err != nil {
-				log.Printf("failed to open submodule repository: %s, %s", submodule.Config().Name, err)
+				if rosterActive {
+					if err := restoreWorktreeSubmodule(options.submoduleRoster, rw, submoduleConfig, branches, branchVersions, err); err != nil {
+						return nil, nil, err
+					}
+					continue
+				}
+				log.Printf("failed to open submodule repository: %s, %s", submoduleConfig.Name, err)
 				continue
 			}
 
 			sw, subVersions, err := prepareNormalBuildRecurse(options, subRepository, repoCache, true)
 			if err != nil {
-				log.Printf("failed to index submodule repository: %s, %s", submodule.Config().Name, err)
+				if rosterActive {
+					if err := restoreWorktreeSubmodule(options.submoduleRoster, rw, submoduleConfig, branches, branchVersions, err); err != nil {
+						return nil, nil, err
+					}
+					continue
+				}
+				log.Printf("failed to index submodule repository: %s, %s", submoduleConfig.Name, err)
 				continue
 			}
 
-			log.Printf("adding subrepository files from: %s", submodule.Config().Name)
+			log.Printf("adding subrepository files from: %s", submoduleConfig.Name)
 
 			for k, repo := range sw {
 				rw.Files[fileKey{
-					SubRepoPath: filepath.Join(submodule.Config().Path, k.SubRepoPath),
+					SubRepoPath: filepath.Join(submoduleConfig.Path, k.SubRepoPath),
 					Path:        k.Path,
 					ID:          k.ID,
 				}] = repo
 			}
 
 			for k, v := range subVersions {
-				branchVersions[filepath.Join(submodule.Config().Path, k)] = v
+				branchVersions[filepath.Join(submoduleConfig.Path, k)] = v
+			}
+
+			if rosterActive {
+				if _, captured := options.submoduleRoster.fresh[submoduleConfig.Name]; !captured {
+					snapshot, err := captureSubmoduleSnapshot(sw)
+					if err != nil {
+						return nil, nil, fmt.Errorf("capture content of submodule %q at %q: %w",
+							submoduleConfig.Name, submoduleConfig.Path, err)
+					}
+					options.submoduleRoster.noteFresh(
+						submoduleConfig.Name,
+						submoduleConfig.Path,
+						submoduleConfig.URL,
+						gitlinkVersion(branchVersions, branches, submoduleConfig.Path),
+						snapshot,
+					)
+				}
+			}
+		}
+
+		if rosterActive {
+			// Every gitlink in an indexed parent tree must be attributable
+			// to a .gitmodules entry. A gitlink without one means content
+			// whose ownership cannot be confirmed, so the whole update must
+			// not land.
+			for _, b := range branches {
+				for subPath := range branchVersions[b] {
+					if !pathAttributed(configuredPaths, subPath) {
+						return nil, nil, fmt.Errorf("%w: gitlink %q on branch %q is not described by .gitmodules",
+							errSubmoduleUnattributable, subPath, b)
+					}
+				}
 			}
 		}
 	}
@@ -1212,31 +1314,125 @@ func prepareNormalBuildRecurse(options Options, repository *git.Repository, repo
 	return rw.Files, branchVersions, nil
 }
 
+// gitlinkVersion returns the gitlink commit recorded for subPath by the
+// parent tree walk, preferring the first indexed branch.
+func gitlinkVersion(branchVersions map[string]map[string]plumbing.Hash, branches []string, subPath string) string {
+	for _, b := range branches {
+		if versions, ok := branchVersions[b]; ok {
+			if hash, ok := versions[subPath]; ok {
+				return hash.String()
+			}
+		}
+	}
+	return ""
+}
+
+// pathAttributed reports whether subPath is one of the configured submodule
+// paths or nested beneath one.
+func pathAttributed(configuredPaths map[string]struct{}, subPath string) bool {
+	if _, ok := configuredPaths[subPath]; ok {
+		return true
+	}
+	for configuredPath := range configuredPaths {
+		if strings.HasPrefix(subPath, configuredPath+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+// restoreWorktreeSubmodule injects the roster snapshot of a checked-out
+// submodule that could not be opened or walked, re-prefixed to its current
+// path so submodule moves do not leave stale copies behind. Without saved
+// content it returns errSubmoduleUnavailable so the entire update is
+// abandoned rather than silently dropping the submodule.
+func restoreWorktreeSubmodule(
+	roster *submoduleRoster,
+	rw *RepoWalker,
+	submoduleConfig *config.Submodule,
+	branches []string,
+	branchVersions map[string]map[string]plumbing.Hash,
+	cause error,
+) error {
+	entry := roster.previous(submoduleConfig.Name)
+	if entry == nil {
+		return fmt.Errorf("%w: submodule %q at %q cannot be read (%v) and no last-known-good content is saved",
+			errSubmoduleUnavailable, submoduleConfig.Name, submoduleConfig.Path, cause)
+	}
+	if entry.Path != "" && entry.Path != submoduleConfig.Path {
+		log.Printf("submodule %q moved from %q to %q; restoring saved content at the new path",
+			submoduleConfig.Name, entry.Path, submoduleConfig.Path)
+	}
+	snapshot, err := roster.loadSnapshot(entry)
+	if err != nil {
+		return fmt.Errorf("%w: cannot restore submodule %q at %q from saved content: %v",
+			errSubmoduleUnavailable, submoduleConfig.Name, submoduleConfig.Path, err)
+	}
+
+	var submoduleURL *url.URL
+	if u, err := url.Parse(submoduleConfig.URL); err == nil && u.IsAbs() {
+		submoduleURL = u
+	}
+	injectSubmoduleSnapshot(rw.Files, submoduleConfig.Path, submoduleURL, branches, snapshot)
+
+	// The parent tree walk already recorded the current gitlink commit for
+	// every configured path, so the restored submodule keeps its current
+	// version even though its content is stale.
+	roster.noteReused(
+		submoduleConfig.Name,
+		submoduleConfig.Path,
+		submoduleConfig.URL,
+		gitlinkVersion(branchVersions, branches, submoduleConfig.Path),
+	)
+	log.Printf("submodule %q at %q is temporarily unreadable (%v); serving its last-known-good content",
+		submoduleConfig.Name, submoduleConfig.Path, cause)
+	return nil
+}
+
 func createDocument(key fileKey,
 	repos map[fileKey]BlobLocation,
 	opts index.Options,
 ) (index.Document, error) {
 	repo := repos[key]
-	blob, err := repo.GitRepo.BlobObject(key.ID)
 	branches := repos[key].Branches
 
-	// We filter out large documents when fetching the repo. So if an object is too large, it will not be found.
-	if errors.Is(err, plumbing.ErrObjectNotFound) {
-		return skippedDoc(key, branches, index.SkipReasonTooLarge), nil
-	}
-
-	if err != nil {
-		return index.Document{}, err
-	}
-
 	keyFullPath := key.FullPath()
-	if blob.Size > int64(opts.SizeMax) && !opts.IgnoreSizeMax(keyFullPath) {
+
+	// A roster-restored placeholder for a blob the submodule could not
+	// provide is reproduced as a skipped document.
+	if repo.inlineMissing {
 		return skippedDoc(key, branches, index.SkipReasonTooLarge), nil
 	}
 
-	contents, err := blobContents(blob)
-	if err != nil {
-		return index.Document{}, err
+	var contents []byte
+	if repo.inline != nil {
+		// Content restored from the submodule roster because the submodule
+		// itself is temporarily unreadable.
+		contents = repo.inline
+	} else {
+		blob, err := repo.GitRepo.BlobObject(key.ID)
+
+		// We filter out large documents when fetching the repo. So if an object is too large, it will not be found.
+		if errors.Is(err, plumbing.ErrObjectNotFound) {
+			return skippedDoc(key, branches, index.SkipReasonTooLarge), nil
+		}
+
+		if err != nil {
+			return index.Document{}, err
+		}
+
+		if blob.Size > int64(opts.SizeMax) && !opts.IgnoreSizeMax(keyFullPath) {
+			return skippedDoc(key, branches, index.SkipReasonTooLarge), nil
+		}
+
+		contents, err = blobContents(blob)
+		if err != nil {
+			return index.Document{}, err
+		}
+	}
+
+	if int64(len(contents)) > int64(opts.SizeMax) && !opts.IgnoreSizeMax(keyFullPath) {
+		return skippedDoc(key, branches, index.SkipReasonTooLarge), nil
 	}
 
 	return index.Document{

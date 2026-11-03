@@ -23,6 +23,10 @@ import (
 
 // SubmoduleEntry represent one entry in a .gitmodules file
 type SubmoduleEntry struct {
+	// Name is the stable identity of the submodule, i.e. the name of the
+	// "[submodule \"<name>\"]" section. It survives path and URL changes, so
+	// it is used to track submodules across moves.
+	Name   string
 	Path   string
 	URL    string
 	Branch string
@@ -52,7 +56,7 @@ func ParseGitModules(content []byte) (map[string]*SubmoduleEntry, error) {
 
 		for _, ss := range s.Subsections {
 			name := ss.Name
-			e := &SubmoduleEntry{}
+			e := &SubmoduleEntry{Name: name}
 			for _, o := range ss.Options {
 				switch o.Key {
 				case "branch":

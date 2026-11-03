@@ -15,6 +15,7 @@
 package gitindex
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -43,6 +44,13 @@ type RepoWalker struct {
 	// Path => SubmoduleEntry
 	submodules map[string]*SubmoduleEntry
 	repoCache  *RepoCache
+
+	// roster, when set, persists last-known-good submodule content for the
+	// top-level repository. A submodule that cannot be read is served from
+	// its roster snapshot; submodules for which no snapshot exists, or whose
+	// attribution cannot be confirmed, fail the whole walk. It is always nil
+	// on walkers recursing into a submodule.
+	roster *submoduleRoster
 }
 
 // subURL returns the URL for a submodule.
@@ -147,6 +155,12 @@ func (rw *RepoWalker) CollectFiles(t *object.Tree, branch string) (map[string]pl
 
 func (rw *RepoWalker) tryHandleSubmodule(p string, id *plumbing.Hash, branch string, subRepoVersions map[string]plumbing.Hash, ig *ignore.Matcher) error {
 	if err := rw.handleSubmodule(p, id, branch, subRepoVersions, ig); err != nil {
+		// With a roster in use, an unavailable submodule without a usable
+		// snapshot, or one whose ownership cannot be confirmed, must abort
+		// the update instead of silently dropping the submodule's files.
+		if rw.roster != nil && (errors.Is(err, errSubmoduleUnavailable) || errors.Is(err, errSubmoduleUnattributable)) {
+			return err
+		}
 		log.Printf("submodule %s: ignoring error %v", p, err)
 	}
 	return nil
@@ -155,26 +169,35 @@ func (rw *RepoWalker) tryHandleSubmodule(p string, id *plumbing.Hash, branch str
 func (rw *RepoWalker) handleSubmodule(p string, id *plumbing.Hash, branch string, subRepoVersions map[string]plumbing.Hash, ig *ignore.Matcher) error {
 	submod := rw.submodules[p]
 	if submod == nil {
+		// The tree references a submodule but .gitmodules does not describe
+		// it, so its content cannot be attributed to this repository.
+		if rw.roster != nil {
+			return fmt.Errorf("%w: gitlink at %q has no .gitmodules entry", errSubmoduleUnattributable, p)
+		}
 		return fmt.Errorf("no entry for submodule path %q", rw.repoURL)
 	}
 
 	subURL, err := rw.subURL(submod.URL)
 	if err != nil {
+		if rw.roster != nil {
+			return fmt.Errorf("%w: submodule %q at %q has unusable URL %q: %v",
+				errSubmoduleUnattributable, submod.Name, p, submod.URL, err)
+		}
 		return err
 	}
 
 	subRepo, err := rw.repoCache.Open(subURL)
 	if err != nil {
-		return err
+		return rw.useRosterSnapshot(submod, p, subURL, id, branch, subRepoVersions, err)
 	}
 
 	obj, err := subRepo.CommitObject(*id)
 	if err != nil {
-		return err
+		return rw.useRosterSnapshot(submod, p, subURL, id, branch, subRepoVersions, err)
 	}
 	tree, err := subRepo.TreeObject(obj.TreeHash)
 	if err != nil {
-		return err
+		return rw.useRosterSnapshot(submod, p, subURL, id, branch, subRepoVersions, err)
 	}
 
 	subRepoVersions[p] = *id
@@ -182,8 +205,21 @@ func (rw *RepoWalker) handleSubmodule(p string, id *plumbing.Hash, branch string
 	sw := NewRepoWalker(subRepo, subURL.String(), rw.repoCache)
 	subVersions, err := sw.CollectFiles(tree, branch)
 	if err != nil {
-		return err
+		return rw.useRosterSnapshot(submod, p, subURL, id, branch, subRepoVersions, err)
 	}
+
+	if rw.roster != nil {
+		// The same submodule is visited once per indexed branch; capture
+		// its snapshot on the first successful visit.
+		if _, captured := rw.roster.fresh[submod.Name]; !captured {
+			snapshot, err := captureSubmoduleSnapshot(sw.Files)
+			if err != nil {
+				return fmt.Errorf("capture content of submodule %q at %q: %w", submod.Name, p, err)
+			}
+			rw.roster.noteFresh(submod.Name, p, submod.URL, id.String(), snapshot)
+		}
+	}
+
 	for k, repo := range sw.Files {
 		rw.Files[fileKey{
 			SubRepoPath: filepath.Join(p, k.SubRepoPath),
@@ -194,6 +230,40 @@ func (rw *RepoWalker) handleSubmodule(p string, id *plumbing.Hash, branch string
 	for k, v := range subVersions {
 		subRepoVersions[filepath.Join(p, k)] = v
 	}
+	return nil
+}
+
+// useRosterSnapshot is called when a submodule attributed at p cannot be read.
+// Without a roster it returns cause unchanged (the caller logs and skips the
+// submodule, the historical behavior). With a roster it restores the last
+// successfully indexed content, or returns errSubmoduleUnavailable when no
+// trusted snapshot exists so the whole index update is abandoned.
+func (rw *RepoWalker) useRosterSnapshot(submod *SubmoduleEntry, p string, subURL *url.URL, id *plumbing.Hash, branch string, subRepoVersions map[string]plumbing.Hash, cause error) error {
+	if rw.roster == nil {
+		return cause
+	}
+
+	entry := rw.roster.previous(submod.Name)
+	if entry == nil {
+		return fmt.Errorf("%w: submodule %q at %q cannot be read (%v) and no last-known-good content is saved",
+			errSubmoduleUnavailable, submod.Name, p, cause)
+	}
+	// A previously moved submodule must be restored at its CURRENT tree
+	// path; the snapshot stores paths relative to the submodule root.
+	if entry.Path != "" && entry.Path != p {
+		log.Printf("submodule %q moved from %q to %q; restoring saved content at the new path", submod.Name, entry.Path, p)
+	}
+	snapshot, err := rw.roster.loadSnapshot(entry)
+	if err != nil {
+		return fmt.Errorf("%w: cannot restore submodule %q at %q from saved content: %v",
+			errSubmoduleUnavailable, submod.Name, p, err)
+	}
+
+	injectSubmoduleSnapshot(rw.Files, p, subURL, []string{branch}, snapshot)
+	subRepoVersions[p] = *id
+	rw.roster.noteReused(submod.Name, p, submod.URL, id.String())
+	log.Printf("submodule %q at %q is temporarily unreadable (%v); serving its last-known-good content",
+		submod.Name, p, cause)
 	return nil
 }
 
@@ -253,6 +323,14 @@ type BlobLocation struct {
 
 	// Branches is the list of branches that contain the blob.
 	Branches []string
+
+	// inline carries the blob contents restored from the submodule roster
+	// when the submodule itself is unreadable. When inline is non-nil the
+	// blob is read from here instead of from GitRepo.
+	inline []byte
+	// inlineMissing reproduces a blob that the captured submodule could not
+	// provide; the document is emitted as skipped instead of being dropped.
+	inlineMissing bool
 }
 
 func (l *BlobLocation) Blob(id *plumbing.Hash) ([]byte, error) {

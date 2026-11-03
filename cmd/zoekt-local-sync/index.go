@@ -143,7 +143,7 @@ func removeShard(path string) error {
 	return errors.Join(errs...)
 }
 
-func applyRemovals(actions []pruneAction, dryRun bool, out io.Writer) error {
+func applyRemovals(actions []pruneAction, dryRun bool, out io.Writer, rosterDir string) error {
 	var errs []error
 	for _, action := range actions {
 		if dryRun {
@@ -153,6 +153,15 @@ func applyRemovals(actions []pruneAction, dryRun bool, out io.Writer) error {
 		fmt.Fprintf(out, "Removing %s (repository %q, source %s: %s)\n", action.Shard, action.Name, action.Source, action.Reason)
 		if err := removeShard(action.Shard); err != nil {
 			errs = append(errs, fmt.Errorf("remove shard %s: %w", action.Shard, err))
+			// Keep the persisted submodule content until the parent shard
+			// is gone, so a failed removal can be retried consistently.
+			continue
+		}
+		// The parent repository is gone, so retire its saved submodule
+		// content and attribution as well. Best effort: a leftover roster
+		// directory is invisible to search and is overwritten on reuse.
+		if err := gitindex.DeleteSubmoduleRoster(rosterDir, action.Source); err != nil {
+			fmt.Fprintf(out, "Warning: failed to retire submodule roster for source %s: %v\n", action.Source, err)
 		}
 	}
 	return errors.Join(errs...)
@@ -264,7 +273,7 @@ func selectRecords(records []repositoryRecord, selectors []string) ([]repository
 	return result, nil
 }
 
-func removeRepositories(indexDir string, selectors []string, dryRun bool, out io.Writer) error {
+func removeRepositories(indexDir string, selectors []string, dryRun bool, out io.Writer, rosterDir string) error {
 	shards, err := readInventory(indexDir)
 	if err != nil {
 		return err
@@ -287,5 +296,5 @@ func removeRepositories(indexDir string, selectors []string, dryRun bool, out io
 	}
 
 	sort.Slice(actions, func(i, j int) bool { return actions[i].Shard < actions[j].Shard })
-	return applyRemovals(actions, dryRun, out)
+	return applyRemovals(actions, dryRun, out, rosterDir)
 }

@@ -40,12 +40,32 @@ type directoryLock struct {
 type stringSliceFlag []string
 
 type syncConfig struct {
-	force        bool
-	branches     string
-	branchPrefix string
-	allowMissing bool
-	submodules   bool
-	buildOptions index.Options
+	force           bool
+	branches        string
+	branchPrefix    string
+	allowMissing    bool
+	submodules      bool
+	submoduleRoster string
+	buildOptions    index.Options
+}
+
+// defaultSubmoduleRosterDir is the roster directory relative to the index
+// directory. It stores each submodule's last-known-good content and its
+// attribution to its parent repository.
+const defaultSubmoduleRosterDir = ".submodule-roster"
+
+// resolveSubmoduleRosterDir picks the roster directory: an explicit path is
+// honored, "none" disables the roster, and the default lives next to the
+// search shards.
+func resolveSubmoduleRosterDir(indexDir, value string) string {
+	switch value {
+	case "":
+		return filepath.Join(indexDir, defaultSubmoduleRosterDir)
+	case "none":
+		return ""
+	default:
+		return value
+	}
 }
 
 func (f *stringSliceFlag) String() string {
@@ -115,6 +135,7 @@ func newSyncFlagSet(name string, output io.Writer) (*flag.FlagSet, *syncConfig) 
 	flags.StringVar(&config.branchPrefix, "prefix", "refs/heads/", "prefix for branch names")
 	flags.BoolVar(&config.allowMissing, "allow_missing_branches", false, "allow missing branches")
 	flags.BoolVar(&config.submodules, "submodules", true, "recurse into submodules")
+	flags.StringVar(&config.submoduleRoster, "submodule-roster", "", "directory storing each submodule's last-known-good content and its attribution (default: <index>/"+defaultSubmoduleRosterDir+"; use \"none\" to disable)")
 	defaults := index.Options{IndexDir: index.DefaultDir}
 	defaults.SetDefaults()
 	flags.StringVar(&config.buildOptions.IndexDir, "index", defaults.IndexDir, "directory for search indices")
@@ -147,6 +168,7 @@ func runSync(name string, args []string, out, errOut io.Writer) error {
 		return err
 	}
 	config.buildOptions.IndexDir = indexDir
+	rosterDir := resolveSubmoduleRosterDir(indexDir, config.submoduleRoster)
 
 	if config.force {
 		lock, err := acquireDirectoryLock(indexDir)
@@ -165,7 +187,7 @@ func runSync(name string, args []string, out, errOut io.Writer) error {
 		return err
 	}
 	actions := planPrune(repositories, shards)
-	if err := applyRemovals(actions, !config.force, out); err != nil {
+	if err := applyRemovals(actions, !config.force, out, rosterDir); err != nil {
 		return err
 	}
 
@@ -175,6 +197,7 @@ func runSync(name string, args []string, out, errOut io.Writer) error {
 		BranchPrefix:       config.branchPrefix,
 		AllowMissingBranch: config.allowMissing,
 		Submodules:         config.submodules,
+		SubmoduleRosterDir: rosterDir,
 		Incremental:        true,
 		DryRun:             !config.force,
 	}, out); err != nil {
@@ -211,6 +234,7 @@ func runRemove(args []string, out, errOut io.Writer) error {
 	flags := flag.NewFlagSet("zoekt-local-sync remove", flag.ContinueOnError)
 	flags.SetOutput(errOut)
 	indexDir := flags.String("index", index.DefaultDir, "directory containing Zoekt index shards")
+	submoduleRoster := flags.String("submodule-roster", "", "directory storing submodule last-known-good content (default: <index>/"+defaultSubmoduleRosterDir+"; use \"none\" to disable)")
 	force := flags.Bool("f", false, "remove the selected repositories")
 	flags.Usage = func() {
 		fmt.Fprintf(flags.Output(), "Usage: zoekt-local-sync remove [-f] [-index dir] <name-or-source> [<name-or-source>...]\n")
@@ -226,6 +250,7 @@ func runRemove(args []string, out, errOut io.Writer) error {
 	if err != nil {
 		return err
 	}
+	rosterDir := resolveSubmoduleRosterDir(dir, *submoduleRoster)
 
 	if *force {
 		lock, err := acquireDirectoryLock(dir)
@@ -234,7 +259,7 @@ func runRemove(args []string, out, errOut io.Writer) error {
 		}
 		defer lock.Close() // best-effort unlock on process exit
 	}
-	if err := removeRepositories(dir, flags.Args(), !*force, out); err != nil {
+	if err := removeRepositories(dir, flags.Args(), !*force, out, rosterDir); err != nil {
 		return err
 	}
 	if !*force {
